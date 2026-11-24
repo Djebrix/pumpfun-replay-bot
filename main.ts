@@ -123,7 +123,18 @@ await runBot({
   onBatch(state: BotState, batch: Batch): OrderInput[] {
     // Snapshot trade counts before this batch's events, so the entry can
     // fire exactly on the batch where the count first reaches ENTRY_TRADES.
-    for (const t of tracked.values()) t.tradesBeforeBatch = t.trades;
+    // Only the mints in this batch can be judged this batch, so snapshot
+    // just those. Sweeping every coin ever seen on every batch made the
+    // run quadratic in the window (batches x coins): on the 1/16 dev
+    // sample that sweep alone was 36.9M iterations, half of all onBatch
+    // time, and on a full 24h window it is what blows the 1800s wall
+    // budget. Mints absent from this batch are never consulted below —
+    // the entry loop only visits mints in batch.events — so their stale
+    // tradesBeforeBatch is never read.
+    for (const e of batch.events) {
+      const t = tracked.get(e.mint);
+      if (t !== undefined) t.tradesBeforeBatch = t.trades;
+    }
 
     for (const e of batch.events) {
       if (e.event === 'CreateEvent') {
@@ -145,7 +156,13 @@ await runBot({
 
     // Refresh held positions from the account the fills reported.
     for (const [mint, h] of held) {
-      if (!state.positions.has(mint)) held.delete(mint);
+      if (!state.positions.has(mint)) {
+        held.delete(mint);
+        // Decided and gone: the coin can never re-enter, so its
+        // per-trade state can go too instead of lingering to the end
+        // of the window.
+        tracked.delete(mint);
+      }
     }
     for (const [mint, pos] of state.positions) {
       if (!held.has(mint)) {
@@ -214,28 +231,40 @@ await runBot({
       if (t === undefined || t.firstVq === null || t.firstVt === null) continue;
       // Exactly on the batch where the trade count first reaches ENTRY_TRADES.
       if (!(t.tradesBeforeBatch < ENTRY_TRADES && t.trades >= ENTRY_TRADES)) continue;
-      // The first ENTRY_TRADES trades must be a burst, not a trickle.
-      if (t.firstSlots.length < ENTRY_TRADES) continue;
-      if (t.firstSlots[ENTRY_TRADES - 1] - t.firstSlots[0] > ENTRY_SPAN_SLOTS) continue;
+      // This batch judges the coin once and for all: the count only moves
+      // past ENTRY_TRADES, so a coin judged here never gets another entry
+      // window whether it passes or fails (the original code left failed
+      // coins undecided, but the exact-trade-5 condition above already
+      // blocks any later entry). Record the verdict now and drop its
+      // per-trade state when it fails, instead of carrying every judged
+      // coin to the end of the 24h window.
+      decided.add(mint);
       const curve = state.curves.get(mint);
-      if (curve === undefined || curve.complete) continue;
-      // Price >= 2x the first trade's price  <=>  vq * firstVt >= 2 * firstVq * vt.
-      if (
-        curve.virtual_quote_reserves * t.firstVt * ENTRY_MULT_DEN <
-        ENTRY_MULT_NUM * t.firstVq * curve.virtual_token_reserves
-      ) {
+      const cap = state.maxBuyLamports(mint);
+      // The first ENTRY_TRADES trades must be a burst, not a trickle.
+      const burst =
+        t.firstSlots.length >= ENTRY_TRADES &&
+        t.firstSlots[ENTRY_TRADES - 1] - t.firstSlots[0] <= ENTRY_SPAN_SLOTS &&
+        curve !== undefined &&
+        !curve.complete &&
+        // Price >= 2x the first trade's price  <=>  vq * firstVt >= 2 * firstVq * vt.
+        curve.virtual_quote_reserves * t.firstVt * ENTRY_MULT_DEN >=
+          ENTRY_MULT_NUM * t.firstVq * curve.virtual_token_reserves &&
+        // Buy-dominated flow.
+        t.buySol + t.sellSol !== 0n &&
+        t.buySol * BUY_SHARE_DEN >= BUY_SHARE_NUM * (t.buySol + t.sellSol) &&
+        // Enough real reserve for a meaningful buy.
+        curve.real_quote_reserves >= MIN_REAL_LAMPORTS &&
+        cap >= MIN_BUY_LAMPORTS;
+      if (!burst) {
+        tracked.delete(mint);
         continue;
       }
-      // Buy-dominated flow.
-      const totalSol = t.buySol + t.sellSol;
-      if (totalSol === 0n) continue;
-      if (t.buySol * BUY_SHARE_DEN < BUY_SHARE_NUM * totalSol) continue;
-      // Enough real reserve for a meaningful buy.
-      if (curve.real_quote_reserves < MIN_REAL_LAMPORTS) continue;
-      const cap = state.maxBuyLamports(mint);
-      if (cap < MIN_BUY_LAMPORTS) continue;
       const amount = cap < STAKE_LAMPORTS ? cap : STAKE_LAMPORTS;
-      if (free < amount + tx) continue;
+      if (free < amount + tx) {
+        tracked.delete(mint);
+        continue;
+      }
       const buy: BuyInput = {
         side: 'buy',
         mint,
@@ -243,7 +272,6 @@ await runBot({
         max_slippage_bps: MAX_SLIPPAGE_BPS,
       };
       orders.push(buy);
-      decided.add(mint);
       free -= amount + tx;
       committed += 1;
     }
